@@ -1,0 +1,735 @@
+#!/bin/bash
+###############################################################################
+#
+# lxc-debian-crossarch : template script to create a debian lxc guest
+# This script consolidates and extends the existing lxc debian scripts
+# Copy this script to /usr/share/lxc/templates
+#
+# license:
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+# requires:
+# - lxc-utils package
+# - linux kernel with relevant options enabled (see lxc-checkconfig)
+# - wget and a working internet connection for HTTP fetches
+#
+# output environment description:
+# - uses the latest stage3 and portage (ie: 'very latest gentoo')
+# - creates a veth-connected guest
+# - a virtual ethernet interface appears to the guest as 'eth0' and the
+# host as '<guestname>' (max 15 characters; less show on 'ifconfig')
+# - can optionally be bridged via bridge-utils
+# - a bridge is like a software-switch interface on the host and
+# requires some host configuration, eg:
+# # install bridge utils package, eg: on debian 'apt-get install bridge-utils'
+# brctl addbr virbr0 # create bridge
+# brctl setfd virbr0 0 # set forward delay to 0 seconds
+# ifconfig virbr0 172.20.0.1 # set an IP for the bridge
+# brctl addif virbr0 <guestname> # add guest to bridge
+# # ...iptables SNAT stuff...
+# - guests can be altered to otherwise use a physical interface, vlan, etc.
+# - typical startup time is 0.2-2 seconds
+# - very fast disk IO (unlike paravirtualised solutions)
+#
+# and use it with
+# Usage : lxc-create -t cross-debian -n NAME  -- --arch ARCH \
+# [--mirror MIRROR] [--suite SUITE]
+#
+# examples:
+#
+# to create a debian armhf container
+# lxc-create -t debian-crossarch -n debian-armhf -- --arch armhf
+#
+# to create a raspberian (Raspberry Pi) container:
+# lxc-create -t debian-crossarch -n debian-armhf -- --arch armhf \
+# --mirror http://archive.raspbian.org/raspbian
+#
+#
+# authors:
+# Daniel Lezcano <daniel.lezcano@free.fr>
+# Laurent Vivier <laurent@vivier.eu>
+# Rob van der Hoeven <robvander1234@ziggo.nl>
+# Jose Faisca <jose.faisca@gmail.com>
+# and others.
+#
+###############################################################################
+
+# Defaults only
+SUITE=${SUITE:-stable}
+MIRROR=${MIRROR:-http://ftp.debian.org/debian}
+DEFAULT_LXC=${DEFAULT_LXC:-/etc/default/lxc}
+DEFAULT_CACHE=${DEFAULT_CACHE:-/var/cache/lxc/debian-crossarch}
+DEFAULT_BRIDGE=${DEFAULT_BRIDGE:-virbr0}
+bootstart="false"
+flushcache="false"
+qemu=""
+
+
+find_host_architecture(){
+    hostarch=""
+
+    if [ -x /usr/bin/dpkg ] && /usr/bin/dpkg --print-architecture >/dev/null 2>&1; then
+        hostarch=`/usr/bin/dpkg --print-architecture`
+    elif which udpkg >/dev/null 2>&1 && udpkg --print-architecture >/dev/null 2>&1; then
+        hostarch=`/usr/bin/udpkg --print-architecture`
+    else
+        hostarch=$(uname -m)
+        if [ "$hostarch" = "i686" ]; then
+            hostarch="i386"
+        elif [ "$hostarch" = "x86_64" ]; then
+            hostarch="amd64"
+        elif [ "$hostarch" = "armv7l" ]; then
+            hostarch="armhf"
+        fi
+    fi
+    return 0
+}
+
+find_interpreter() {
+    qemu=$(basename "$1")
+
+    if [ ! -d /proc/sys/fs/binfmt_misc/ ] ; then
+        return 1
+    fi
+    for file in /proc/sys/fs/binfmt_misc/* ; do
+        if [ "$file" = "/proc/sys/fs/binfmt_misc/register" -o \
+             "$file" = "/proc/sys/fs/binfmt_misc/status" ] ; then
+            continue
+        fi
+        interpreter_path=$(sed -n "/^interpreter/s/interpreter \([^[:space:]]*\)/\1/p" "$file")
+        interpreter=$(basename $interpreter_path)
+         
+        if [ "$qemu" = "$interpreter" ] ; then
+            echo "$interpreter_path"
+            return 0
+        fi
+    done
+    return 1
+}
+
+download_debian() {
+    arch="$1"
+
+    if [ ! -d "${DEFAULT_CACHE}/archives-$SUITE-$arch" ]; then
+        if ! mkdir -p "${DEFAULT_CACHE}/archives-$SUITE-$arch" ; then
+            echo "Failed to create '${DEFAULT_CACHE}/archives-$SUITE-$arch' directory"
+            return 1
+        fi
+    fi
+
+    echo "Downloading debian $SUITE $arch..."
+    debootstrap --verbose \
+                --variant=minbase \
+                --download-only \
+                --no-check-gpg \
+                --arch=$arch \
+                ${SUITE} "${DEFAULT_CACHE}/archives-$SUITE-$arch" \
+                ${MIRROR}
+
+    if [ $? -ne 0 ]; then
+        echo "ERROR: failed to download to ${DEFAULT_CACHE}/archives-$SUITE-$arch" 1>&2
+        return 1
+    fi
+
+    echo "Download complete."
+    trap EXIT
+    trap SIGINT
+    trap SIGTERM
+    trap SIGHUP
+
+    return 0
+}
+
+copy_debian() {
+    arch="$1"
+    rootfs="$2"
+
+    echo -n "Copying rootfs to $rootfs..."
+    mkdir -p $rootfs
+    rsync -Ha "${DEFAULT_CACHE}/archives-$SUITE-$arch"/ $rootfs/ || return 1
+    echo "Copy complete."
+    return 0
+}
+
+install_debian() {
+    rootfs="$1"
+    arch="$2"
+
+    mkdir -p /var/lock/subsys/
+    (
+        if ! flock -x 200 ; then
+            echo "Cache repository is busy." 1>&2
+            return 1
+        fi
+
+        if ! download_debian $arch ; then
+            echo "ERROR: Failed to download 'debian base'" 1>&2
+            return 1
+        fi
+
+        if ! copy_debian $arch $rootfs ; then
+            echo "ERROR: Failed to copy rootfs" 1>&2
+            return 1
+        fi
+
+        return 0
+
+    ) 200>/var/lock/subsys/lxc-debian
+
+    return $?
+}
+
+create_root() {
+    rootfs="$1"
+    hostname="$2"
+    arch="$3"
+    include="$4"
+    qemu="$5"
+    interpreter_path="$6"
+
+packages="openssh-server"
+
+    if ! install_debian "$rootfs" "$arch" ; then
+        echo "ERROR: failed to update cache" 1>&2
+        exit 1
+    fi
+
+    if [ "${include}" = "" ]; then
+      include="locales"
+    else
+      include="locales,${include}"
+    fi
+
+    # Debian bootstrap
+    if [ -n "$(which qemu-debootstrap)" ]; then
+        qemu-debootstrap --verbose \
+                    --no-check-gpg \
+                    --foreign \
+                    --arch=$arch \
+                    --include="$packages,$include" \
+                    ${SUITE} "$rootfs" \
+                    ${MIRROR}
+    else
+        debootstrap --verbose \
+                    --no-check-gpg \
+                    --foreign \
+                    --arch=$arch \
+                    --include="$packages,$include" \
+                    ${SUITE} "$rootfs" \
+                    ${MIRROR}
+    fi
+
+    if [ $? -ne 0 ]; then
+        echo "ERROR: failed to debootstrap to $rootfs" 1>&2
+        return 1
+    fi
+
+    # adding qemu binary
+    #if [ "${qemu}" != "" ]; then
+    #    if ! cp "$qemu" "$rootfs/$interpreter_path" ; then
+    #        echo "ERROR: failed to copy $qemu to $rootfs/$interpreter_path" 1>&2
+    #        exit 1
+    #    fi
+    #fi
+
+    # debian bootstrap second stage
+    chroot "$rootfs" debootstrap/debootstrap --second-stage
+
+    return 0
+}
+
+configure_debian() {
+    rootfs="$1"
+    hostname="$2"
+    debian_sign="$3"
+
+    # creating device nodes for tty1-4.
+    for tty in $(seq 1 4); do
+    if [ ! -e $rootfs/dev/tty$tty ]; then
+        mknod $rootfs/dev/tty$tty c 4 $tty
+    fi
+    done
+
+    # set timezone
+    cat /etc/timezone > "$rootfs/etc/timezone"
+    chroot $rootfs dpkg-reconfigure -f noninteractive tzdata
+
+    # configure the inittab
+    cat <<EOF > $rootfs/etc/inittab
+id:3:initdefault:
+si::sysinit:/etc/init.d/rcS
+l0:0:wait:/etc/init.d/rc 0
+l1:1:wait:/etc/init.d/rc 1
+l2:2:wait:/etc/init.d/rc 2
+l3:3:wait:/etc/init.d/rc 3
+l4:4:wait:/etc/init.d/rc 4
+l5:5:wait:/etc/init.d/rc 5
+l6:6:wait:/etc/init.d/rc 6
+# Normally not reached, but fallthrough in case of emergency.
+z6:6:respawn:/sbin/sulogin
+1:2345:respawn:/sbin/getty 38400 console
+c1:12345:respawn:/sbin/getty 38400 tty1 linux
+c2:12345:respawn:/sbin/getty 38400 tty2 linux
+c3:12345:respawn:/sbin/getty 38400 tty3 linux
+c4:12345:respawn:/sbin/getty 38400 tty4 linux
+EOF
+
+    # disable selinux in debian
+    mkdir -p $rootfs/selinux
+    echo 0 > $rootfs/selinux/enforce
+
+    # configure the network using the dhcp
+    cat <<EOF > $rootfs/etc/network/interfaces
+# The loopback network interface
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet dhcp
+EOF
+
+    # set the hostname
+    cat <<EOF > $rootfs/etc/hostname
+$hostname
+EOF
+
+    # set minimal hosts
+    cat <<EOF > $rootfs/etc/hosts
+127.0.0.1   localhost
+127.0.1.1   $hostname
+# The following lines are desirable for IPv6 capable hosts
+::1     ip6-localhost ip6-loopback
+fe00::0 ip6-localnet
+ff00::0 ip6-mcastprefix
+ff02::1 ip6-allnodes
+ff02::2 ip6-allrouters
+EOF
+
+    # let dhcp client report the hostname to dnsmasq
+    cat <<EOF > $rootfs/etc/dhcp/dhclient.conf
+send host-name "$hostname";
+send vendor-class-identifier "lxc.module";
+EOF
+
+    # set package repository
+    cat > "$rootfs/etc/apt/sources.list" <<!EOF
+deb ${MIRROR} ${SUITE} main contrib non-free
+#deb-src ${MIRROR} ${SUITE} main contrib non-free
+!EOF
+
+    # debian sign
+    if [ "$debian_sign" != "" ]; then
+        HOME=/root chroot "$rootfs" gpg --keyserver pgpkeys.mit.edu --recv-key ${debian_sign}
+        HOME=/root chroot "$rootfs" gpg -a --export ${debian_sign} | chroot "$rootfs"  apt-key add -
+    fi
+
+    # update debian
+    chroot "$rootfs" apt-get update
+
+    # reconfigure locale
+    if [ -z "$LANG" ]; then
+        echo "en_US.UTF-8 UTF-8" > "$rootfs/etc/locale.gen"
+        chroot $rootfs locale-gen
+        chroot $rootfs update-locale LANG=en_US.UTF-8
+    else
+        echo "$LANG $(echo $LANG | cut -d. -f2)" > "$rootfs/etc/locale.gen"
+        chroot $rootfs locale-gen
+        chroot $rootfs update-locale LANG=$LANG
+    fi
+
+    # remove pointless services in a container
+    if [ -d "$rootfs/usr/sbin/update-rc.d" ]; then
+        chroot $rootfs /usr/sbin/update-rc.d -f checkroot.sh remove
+        chroot $rootfs /usr/sbin/update-rc.d -f umountfs remove
+        chroot $rootfs /usr/sbin/update-rc.d -f hwclock.sh remove
+        chroot $rootfs /usr/sbin/update-rc.d -f hwclockfirst.sh remove
+        chroot $rootfs /usr/sbin/update-rc.d -f module-init-tools remove
+    fi
+
+    # set default user
+    echo "root:root" | chroot $rootfs chpasswd
+    echo "Root password is 'root', please change !"
+
+    return 0
+}
+
+get_rootfs() {
+    config="$1/config"
+    rootfs=$(sed -n "s/^lxc.rootfs[[:space:]]*=[[:space:]]*\(.*\)/\1/p" $config)
+    if [ "$rootfs" = "" ]
+    then
+        echo "$path/rootfs"
+    else
+        echo "$rootfs"
+    fi
+}
+
+create_lxc() {
+    path="$1"
+    rootfs="$2"
+    hostname="$3"
+    arch="$4"
+
+cat <<EOF >> $path/config
+lxc.tty = 4
+lxc.pts = 1024
+lxc.arch = $arch
+lxc.cap.drop = sys_module mac_admin mac_override sys_time
+lxc.rootfs = $rootfs
+lxc.cgroup.devices.deny = a
+# Allow any mknod (but not using the node)
+lxc.cgroup.devices.allow = c *:* m
+lxc.cgroup.devices.allow = b *:* m
+# /dev/null and zero
+lxc.cgroup.devices.allow = c 1:3 rwm
+lxc.cgroup.devices.allow = c 1:5 rwm
+# consoles
+lxc.cgroup.devices.allow = c 5:1 rwm
+lxc.cgroup.devices.allow = c 5:0 rwm
+lxc.cgroup.devices.allow = c 4:0 rwm
+lxc.cgroup.devices.allow = c 4:1 rwm
+# /dev/{,u}random
+lxc.cgroup.devices.allow = c 1:9 rwm
+lxc.cgroup.devices.allow = c 1:8 rwm
+lxc.cgroup.devices.allow = c 136:* rwm
+lxc.cgroup.devices.allow = c 5:2 rwm
+# rtc
+lxc.cgroup.devices.allow = c 254:0 rwm
+# fuse
+lxc.cgroup.devices.allow = c 10:229 rwm
+# tun
+lxc.cgroup.devices.allow = c 10:200 rwm
+# full
+lxc.cgroup.devices.allow = c 1:7 rwm
+# hpet
+lxc.cgroup.devices.allow = c 10:228 rwm
+# kvm
+lxc.cgroup.devices.allow = c 10:232 rwm
+# networking
+lxc.utsname = $hostname
+lxc.network.type = veth
+lxc.network.flags = up
+lxc.network.link = ${DEFAULT_BRIDGE}
+lxc.network.ipv4 = 0.0.0.0/24
+lxc.network.hwaddr = 00:1E:$(hex):$(hex):$(hex):$(hex)
+EOF
+
+    # mounts point
+    cat <<EOF > $path/fstab
+proc            proc         proc    nodev,noexec,nosuid 0 0
+devpts          dev/pts      devpts  defaults 0 0
+sysfs           sys          sysfs defaults  0 0
+/sys/fs/fuse/connections sys/fs/fuse/connections none bind 0 0
+/sys/kernel/debug sys/kernel/debug none bind 0 0
+/sys/kernel/security sys/kernel/security none bind 0 0
+/sys/fs/pstore sys/fs/pstore none bind,optional 0 0
+EOF
+
+    if [ $? -ne 0 ] ; then
+        echo "ERROR: failed to create configuration" 1>&2
+        exit 1
+    fi
+    return 0
+}
+
+hex()
+{
+  echo "`tr -dc A-F0-9 < /dev/urandom | head -c 2 | xargs`"
+  return 0
+}
+
+clean()
+{
+    if [ ! -e ${DEFAULT_CACHE} ]; then
+        exit 0
+    fi
+
+    # lock, so we won't purge while someone is creating a repository
+    (
+    flock -n -x 200
+    if [ $? != 0 ]; then
+        echo "Cache repository is busy."
+        exit 1
+    fi
+
+    echo -n "Purging the download cache..."
+    rm --preserve-root --one-file-system -rf ${DEFAULT_CACHE} && echo "Done." || exit 1
+    exit 0
+
+    ) 200>/var/lock/subsys/lxc
+}
+
+autostart_lxc(){
+    path="$1"
+    name="$2"
+
+    if [ ! -f ${DEFAULT_LXC} ]; then
+        echo "ERROR: autostart container" 1>&2
+        echo "ERROR: missing ${DEFAULT_LXC}" 1>&2
+        exit 1
+    fi
+
+    LXCA=$(cat ${DEFAULT_LXC} | grep "LXC_AUTO" | cut -d"=" -f2- | tr -d '"')
+    LXCA=$(echo $LXCA | tr [:upper:] [:lower:])
+    if [ $? -ne 0 ]; then
+        echo 'LXC_AUTO="true"' >> ${DEFAULT_LXC}
+    fi
+
+    if [ "$LXCA" != "true" ]; then
+        sed -i '/LXC_AUTO/c \LXC_AUTO="true"' ${DEFAULT_LXC}
+    fi
+
+    # create link
+    $(ln -s $path/config /etc/lxc/auto/$name)
+
+    #LXCDIR=$(cat ${DEFAULT_LXC} | grep "LXC_DIRECTORY" | cut -d"=" -f2- | tr -d '"')
+    if [ -h "/etc/lxc/auto/$name" ]; then
+        echo "container $name will autostart when host boots"
+    else
+        echo "ERROR: autostart container" 1>&2
+        exit 1
+    fi
+
+exit 0
+}
+
+setup_multiarch(){
+    rootfs="$1"
+    hostarch="$2"
+
+    # If the container isn't running a native architecture, setup multiarch
+    # Multiarch support is present from dpkg 1.16.2 and apt 0.8.13.
+    if [ -x "$(ls -1 ${rootfs}/usr/bin/qemu-*-static 2>/dev/null)" ]; then
+        dpkg_version=$(chroot $rootfs dpkg-query -W -f='${Version}' dpkg)
+        if chroot $rootfs dpkg --compare-versions $dpkg_version ge "1.16.2"; then
+            chroot $rootfs dpkg --add-architecture $hostarch
+        else
+            mkdir -p $rootfs/etc/dpkg/dpkg.cfg.d
+            echo "foreign-architecture $hostarch" > $rootfs/etc/dpkg/dpkg.cfg.d/lxc-multiarch
+        fi
+    fi
+
+exit 0
+}
+
+print_details(){
+    hostarch="$1"
+    osversion=$(cat /etc/*-release | grep "ID")
+    arch="$2"
+    name="$3"
+    path="$4"
+    qemu="$5"
+    include="$6"
+
+    echo ""
+    echo "HOST ARCH         : $hostarch"
+    echo "HOST OS VERSION   : $osversion"
+    echo "CONTAINER ARCH    : $arch"
+    echo "CONTAINER NAME    : $name"
+    echo "CONTAINER PATH    : $path"
+
+    if [ "$qemu" != "" ];then
+    echo "QEMU PATH         : $qemu"
+    fi
+
+    echo "MIRROR            : ${MIRROR}"
+    echo "SUITE             : ${SUITE}"
+    echo "INCLUDE           : $include"
+    echo "LINUX BRIDGE      : ${DEFAULT_BRIDGE}"
+
+return 0
+
+}
+
+usage()
+{
+    cat <<EOF
+
+$1 -h|--help [-a|--arch <arch>] [-m|--mirror <mirror>][-s|--suite <suite>]
+[-i|--include <A,B,C>][-f|--flush-cache] [-b|--boot-start] [-k|--deb-sign <key>]
+[-l|--linux-bridge <bridge>]
+
+    --arch: is container architecture/system (amd64, armel, armhf,
+      i386, ia64, mips, powerpc, s390, s390x, sparc)
+    --mirror: is URL of debian mirror to use
+    --suite: is debian release to install (oldstable, stable, testing,
+      unstable, experimental)
+    --include: is the list of package to add to debootstrap
+    --flush-cache: to purge download cache
+    --boot-start: to autostar container when host boots
+    --deb-sign: debian key
+    --linux-bridge: is Linux network bridge name
+
+EOF
+    return 0
+}
+
+options=$(getopt -o h:p:n:a:s:m:k:i:f:b:l -l help:,path:,name:,arch:,suite:,mirror:,deb-sign:,include:,flush-cache:,boot-start:,linux-bridge: -- "$@")
+if [ $? -ne 0 ]; then
+        usage $(basename $0)
+        exit 1
+fi
+eval set -- "$options"
+
+while true ; do
+    case "$1" in
+    -p|--path)
+        shift
+        path="$1"
+        ;;
+    -n|--name)
+        shift
+        name="$1"
+        ;;
+    -a|--arch)
+        shift
+        arch="$1"
+        ;;
+    -f|--flush-cache)
+        shift
+        flushcache="true"
+        ;;
+    -b|--boot-start)
+        shift
+        bootstart="true"
+        ;;
+    -l|--linux-bridge)
+        shift
+        DEFAULT_BRIDGE="$1"
+        ;;
+    -s|--suite)
+        shift
+        SUITE="$1"
+        ;;
+    -m|--mirror)
+        shift
+        MIRROR="$1"
+        ;;
+    -i|--include)
+        shift
+        include="$1"
+        ;;
+    -k|--deb-sign)
+        shift
+        debian_sign="$1"
+        ;;
+    -h|--help)
+        usage
+        exit 1
+        ;;
+    *)
+        break
+        ;;
+    esac
+    shift
+done
+
+if [ "$path" = "" -o "$name" = "" ]; then
+    echo "ERROR: missing parameter" 1>&2
+    usage
+    exit 1
+fi
+
+dversion=$(cat /etc/debian_version)
+if [ $? -ne 0 ]; then
+    echo "WARNING: host system is not Debian Linux" 1>&2
+else
+    echo "host system is Debian Linux $dversion" 1>&2
+fi
+
+# find host architecture
+find_host_architecture
+
+if [ "$arch" = "" ]; then
+    arch=$hostarch
+fi
+
+if [ $hostarch = "i386" -a $arch = "amd64" ]; then
+    echo "can't create $arch container on $hostarch"
+    exit 1
+fi
+
+if [ $hostarch = "armhf" -o $hostarch = "armel" ] && \
+[ $arch != "armhf" -a $arch != "armel" ]; then
+    echo "can't create $arch container on $hostarch"
+    exit 1
+fi
+
+if [ $hostarch = "powerpc" -a $arch != "powerpc" ]; then
+    echo "can't create $arch container on $hostarch"
+    exit 1
+fi
+
+if ! type debootstrap ; then
+    echo "ERROR: 'debootstrap' command is missing" 1>&2
+    exit 1
+fi
+
+# use qemu
+if [ $hostarch != $arch ] && \
+[ $arch != "i386" ]; then
+
+    # qemu-arm-static path
+    qemu=$(which qemu-arm-static)
+
+    if ! type qemu-debootstrap ; then
+        echo "ERROR: 'qemu-debootstrap' command is missing" 1>&2
+        exit 1
+    fi
+
+    if [ -z "$qemu" -a "$qemu" != " " ]; then
+        echo "ERROR: missing qemu-arm-static binary" 1>&2
+        exit 1
+    fi
+
+    if ! file -b "${qemu}" |grep -q "statically linked" ; then
+        echo "ERROR: '${qemu}' must be statically linked" 1>&2
+        exit 1
+    fi
+
+    interpreter_path=$(find_interpreter "$qemu")
+    if [ $? -ne 0 ] ; then
+        echo "ERROR: no binfmt interpreter using $(basename $qemu)" 1>&2
+        exit 1
+    fi
+fi
+
+# get rootfs
+rootfs=$(get_rootfs $path)
+
+print_details "$hostarch" "$arch" "$name" "$path" "$qemu" "$include"
+
+# create rootfs
+create_root "$rootfs" "$name" "$arch" "$include" "$qemu" "$interpreter_path"
+
+# configure debian
+configure_debian "$rootfs" "$name" "$debian_sign"
+
+# create container
+create_lxc "$path" "$rootfs" "$name" "$arch"
+
+# setup multi architecture
+setup_multiarch "$rootfs" "$hostarch"
+
+# autostart container when host boots
+if [ "$bootstart" == "true" ]
+    autostart_lxc "$path" "$name"
+fi
+
+# purge downlocad cache
+if [ "$flushcache" == "true" ]; then
+    clean
+fi
+
+exit 0
