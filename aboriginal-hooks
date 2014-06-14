@@ -1,0 +1,649 @@
+#!/bin/bash 
+###############################################################################
+#
+# A hook to be run in the host's namespace 
+# Copy this script to /usr/share/lxc/hooks
+#
+# UBUNTU: add more loop devices:
+# edit /etc/defaults/grub
+# and the code max_loop=64 just after the GRUB_CMDLINE_LINUX_DEFAULT="quiet splash
+# save then run update-grub and reboot the machine
+#
+# The following environment variables affect the behavior of this script:
+# HDA - Image file to use for /rootfs
+# HDB - Image file to use for hdb on /home (creates a new hdb.img if blank)
+# HDBMEGS - Size (in decimal megabytes) when creating hdb.img
+# HDC - Image file to use for hdc on /mnt (none of blank)
+#
+# authors:
+# Jose Faisca <jose.faisca@gmail.com>
+# Rob Landley <rob@landley.net>
+#
+###############################################################################
+
+exec_out() {
+ cmd=$1
+ output=$2
+ # send output to file
+ $cmd >> "$output" 2>&1
+}
+
+exec_no_out() {
+ cmd=$1
+ # silence the output
+ $cmd 2> /dev/null
+}
+
+unique_port() {
+  # Try to find an unused port number for each running instance of the program.
+  local UNUSED_PORT=""
+  START=8192
+  RANGE=$[$(awk '{print $1}' /proc/sys/net/ipv4/ip_local_port_range)-$START]
+  if [ $RANGE -lt 8 ]; then
+    START=$[$(awk '{print $2}' /proc/sys/net/ipv4/ip_local_port_range)]
+    RANGE=$[65535-$START]
+    if [ $RANGE -lt 8 ]; then
+      START=16384
+      RANGE=32768
+    fi
+  fi
+
+  UNUSED_PORT=$START
+  while netstat -atwn | grep "^.*:${UNUSED_PORT}.*:\*\s*LISTEN\s*$" > /dev/null; do
+      UNUSED_PORT=$(( ${UNUSED_PORT} + 1 ))
+  done
+
+  echo "${UNUSED_PORT}"
+}
+
+
+setup_hdb(){
+MB=$1
+# Should we set up an ext3 image as a second virtual hard drive for /home?
+if [ "$MB" != "0" ]; then
+  [ -z "$HDB" ] && HDB=hdb.img
+    if [ ! -e "$HDB" ]; then
+      # If we don't already have an hdb image, should we set up a sparse file and
+      # format it ext3?
+      [ -z "$MB" ] && MB=2048
+      make_hdb $MB
+    fi
+fi
+}
+
+make_hdb() {
+
+   MB=$1
+  # Some distros don't put /sbin:/usr/sbin in the $PATH for non-root users.
+
+  if [ -z "$(which  mke2fs)" ] || [ -z "$(which tune2fs)" ]; then
+    export PATH=/sbin:/usr/sbin:$PATH
+  fi
+
+  truncate -s ${MB}m "$HDB" &&
+  mke2fs -q -b 1024 -F "$HDB" -i 4096 &&
+  tune2fs -j -c 0 -i 0 "$HDB"
+
+  [ $? -ne 0 ] && exit 1
+}
+
+check_process(){
+ # chech if process is running
+ NAME="$1"
+ PIDFILE="$2"
+
+ [ "$NAME" = "" ]  && return 1
+ [ "$PIDFILE" = "" ]  && return 1
+
+ if [ -e "$PIDFILE" ]; then
+    PIDNR=$(pgrep -F $PIDFILE) >> "${OUTPUT_FILE}" 2>&1
+ else
+    return 1 # not running
+ fi
+
+ pidof $NAME | grep -w $PIDNR  > /dev/null
+ if [ $? -eq 0 ]; then
+    return 0 # running
+  else
+    return 1 # not running
+ fi
+}
+
+kill_process(){
+ # kill process
+ NAME="$1"
+ PIDFILE="$2"
+
+ [ "$NAME" = "" ]  && return 0
+ [ "$PIDFILE" = "" ]  && return 0
+
+ if [ -e "$PIDFILE" ]; then
+    PIDNR=$(pgrep -F $PIDFILE) >> "${OUTPUT_FILE}" 2>&1
+    kill $PIDNR >> "${OUTPUT_FILE}" 2>&1 # kill
+ else
+    return 0 # not running
+ fi
+
+ pidof $NAME | grep -w $PIDNR  > /dev/null
+ if [ $? -eq 0 ]; then
+    return 1 # kill failled
+  else
+    return 0 # killed
+ fi
+}
+
+remove_tmpdir(){
+# remove tmpdir
+TDIR="$1"
+ (rm -rf $TDIR >> "${OUTPUT_FILE}" 2>&1) || return 1
+ return 0
+}
+
+create_tmpdir(){
+#setup tmpdir
+TDIR="$1"
+U="$2"
+
+ # create tmpdir
+ (umask 077 && mkdir -p $TDIR >> "${OUTPUT_FILE}" 2>&1) || return 1
+ # set tmpdir owner
+ chown $U $TDIR/. >> "${OUTPUT_FILE}" 2>&1 || return 1
+ return 0
+}
+
+clean_up(){
+# perform script exit housekeeping
+# optionally accepts an exit status
+
+ # unmount all loop devices
+ umount_all_loop
+ # kill distccd process
+ kill_process "${DISTCC}" "${DISTCC_PID}" &&  echo "${DISTCC} stop/waiting" >> "${OUTPUT_FILE}"
+ # remove distccd tmpdir
+ remove_tmpdir "${DISTCC_TMPDIR}" && echo "${DISTCC_TMPDIR} removed" >> "${OUTPUT_FILE}"
+ # kill ftpd process
+ kill_process "${FTP}" "${FTP_PID}" &&  echo "${FTP} stop/waiting" >> "${OUTPUT_FILE}"
+ # remove ftpd tmpdir
+ remove_tmpdir "${FTP_TMPDIR}" && echo "${FTP_TMPDIR} removed" >> "${OUTPUT_FILE}"
+ exit $1
+}
+
+copy_qemu(){
+# copy qemu static to lxc container
+QARCH="$1"
+
+static_exec="qemu-$QARCH-static"
+QSTATIC="$(which ${static_exec})"
+ if [ -e $QSTATIC ]; then
+  cp $QSTATIC ${LXC_ROOTFS_PATH}/usr/bin >> "${OUTPUT_FILE}" 2>&1
+  return 0
+ else
+  return 1
+ fi
+}
+
+setup_qemu(){
+# setup QEMU
+QARCH="$1"
+
+ copy_qemu "$QARCH"
+ if [ $? -eq 0 ]; then
+   echo "qemu-$QARCH-static copied to lxc container" >> "${OUTPUT_FILE}"
+   return 0
+ else
+   echo "ERROR: failed to copy qemu-$QARCH-static to lxc container" >> "${OUTPUT_FILE}"
+   return 1
+ fi
+}
+
+setup_monit(){
+# add process to monit
+PROCESS_NAME="$1"
+MPID_FILE="$2"
+MPROCESS_NAME="$1"-"${LXC_NAME}"
+
+ # verify monit installation
+ if [ -z "$(which ${MONIT})" ]; then
+        echo "ERROR: ${MONIT} program" >> "${OUTPUT_FILE}"
+      return 1 # program not found
+ else
+    if [ ! -n "${MONIT_CONF}" ]; then
+        # try to find configuration
+        MONIT_CONF=$(cat /etc/init.d/${MONIT} | grep CONFIG | head -1 | cut -d'=' -f2)
+    fi
+ fi
+
+ if [ ! -e $MPID_FILE ]; then 
+   echo "ERROR: $MPID_FILE not found, ${MONIT} configuration failed" >> "${OUTPUT_FILE}" 
+   return 1
+ fi 
+ # modify monit configuration to add distcc
+ if [ -e "${MONIT_CONF}" ]; then
+    countLines=$(cat ${MONIT_CONF} | grep -w $MPROCESS_NAME | wc -l)
+    if [ $countLines -lt 2 ]; then
+        echo "" >> "${MONIT_CONF}"
+        echo "# check $MPROCESS_NAME" >> "${MONIT_CONF}"
+        echo "check process $MPROCESS_NAME" >> "${MONIT_CONF}"
+        echo "  with pidfile $MPID_FILE" >> "${MONIT_CONF}"
+    fi
+    echo "$PROCESS_NAME added to ${MONIT} configuration ${MONIT_CONF}" >> "${OUTPUT_FILE}"
+    return 0 # configuration modified
+ else
+    echo "ERROR: ${MONIT} configuration ${MONIT_CONF} not found" >> "${OUTPUT_FILE}"
+    return 1 # no configuration
+ fi
+}
+
+start_distcc(){
+# start distcc daemon on the host system
+BIN="$1"
+LISTEN="$2"
+ALLOW="$3"
+P="$4"
+JOBS=$5
+ENV1="$6"
+ARCH="$7"
+
+  # remove tmpdir
+  remove_tmpdir "${DISTCC_TMPDIR}" || return 1
+  # create tmpdir
+  create_tmpdir "${DISTCC_TMPDIR}" "${DISTCC_USER}" || return 1
+
+  # Run the distcc daemon on the host system with $PATH restricted to the
+  # cross compiler binaries.
+
+  # Note that we tell it to start as --daemon so lxc.hook.post-stop
+  # find it later to kill it after the lxc container exits.
+
+  $(TMPDIR="$ENV1" PATH="${LXC_DIR}/system-image-"$ARCH"/distcc_links" "$BIN" \
+  --daemon --listen "$LISTEN" --allow "$ALLOW" --port "$P" \
+  --jobs $JOBS --pid-file "${DISTCC_PID}" --user "${DISTCC_USER}" \
+  --log-level="${DISTCC_LOGLEVEL}" --log-file \
+  "${DISTCC_LOG}" >> "${OUTPUT_FILE}" 2>&1) || return 1
+
+  return 0
+}
+
+write_lxcinit() {
+# write lxcinit script on lxc container  
+ARCH="$1"
+PORT="$2"
+CPUS=$3
+HOSTS="$4"
+DISTCC_PATH_PREFIX="$5"
+DISTCC_HOSTS="$6"
+
+    cat << EOF > "${LXC_INITSCRIPT}"
+#!/bin/bash
+#
+# lxcinit script
+#
+
+# If nobody said how many CPUS to use in builds, try to figure it out.
+if [ -z "$CPUS" ]; then
+    export CPUS=$(echo /sys/devices/system/cpu/cpu[0-9]* | wc -w)
+    [ "$CPUS" -lt 1 ] && CPUS=1
+fi
+
+HANDOFF=/bin/ash
+export HOST="$ARCH"
+export PS1="(\$container:$ARCH:$CPUS) \w \\$ "
+export HOME="/home"
+export DISTCC_HOSTS="$DISTCC_HOSTS"
+export PATH="${DISTCC_PATH_PREFIX}/bin:/sbin"
+
+if [ "\$$" -eq 1 ]; then
+    cd /home
+    if [ -z "\$DISTCC_HOSTS" ];then
+        echo "Not using distcc."
+    else
+        echo "Distcc acceleration enabled."
+    fi
+    echo "Type exit when done."
+
+    if [ -e /mnt/init ]; then
+        X=xx
+        echo "Press any key for command line..."
+        read -t 3 -n 1 X
+        if [ "$X" == xx ]; then
+            echo "Running automated build."
+            HANDOFF=/mnt/init
+        fi
+    fi
+    exec "\$HANDOFF"
+# If we're not PID 1, it's probably a chroot.
+else
+    echo "ERROR: executing on a chroot/container"
+    exit 1
+fi
+
+EOF
+
+$(chmod 755 ${LXC_INITSCRIPT} >> "${OUTPUT_FILE}" 2>&1)
+
+return 0
+}
+
+setup_distcc() {
+ # setup distcc
+ HOSTS="$1"
+ ARCH="$2"
+ CPUS=$3
+
+ # If the cross compiler isn't in the $PATH, look for it in the current
+ # directory, the parent directory, and the user's home directory.
+
+ DISTCC_PATH="$(which $ARCH-cc 2>/dev/null | sed 's@\(.*\)/.*@\1@')"
+
+if [ -z "$DISTCC_PATH" ]; then
+  for i in {"${INSTALL_DIR}/","$(pwd)/","$(pwd)/../","$HOME"/}{,simple-}cross-compiler-"$ARCH"/bin
+  do
+    [ -f "$i/$ARCH-cc" ] && DISTCC_PATH="$i" && break
+  done
+fi
+
+[ -z "$(which ${DISTCC})" ] && [ -e ${INSTALL_DIR}/host/${DISTCC} ] &&
+  PATH="$PATH:${INSTALL_DIR}/host"
+
+[ -z "$CPUS" ] && CPUS=1
+
+DISTCC_BIN="$(which ${DISTCC})"
+
+if [ -z "$DISTCC_BIN" ]; then
+  echo "No ${DISTCC} in $PATH, acceleration disabled." >> "${OUTPUT_FILE}"
+  # write lxcinit script
+  write_lxcinit "$ARCH" "" $CPUS "" "" ""
+elif [ -z "$DISTCC_PATH" ]; then
+  echo "No $ARCH-cc in $PATH, acceleration disabled." >> "${OUTPUT_FILE}"
+  # write lxcinit script
+  write_lxcinit "$ARCH" "" $CPUS "" "" ""
+else
+
+  # Populate a directory full of symlinks to the cross compiler using the
+  # unprefixed names distccd will try to use.
+  mkdir -p "${LXC_DIR}/system-image-$ARCH/distcc_links" &&
+
+  for i in $(cd "$DISTCC_PATH"; ls $ARCH-* | sed "s/^$ARCH-//" ); do
+    ln --symbolic --force "$DISTCC_PATH/$ARCH-$i" "${LXC_DIR}/system-image-$ARCH/distcc_links/$i"
+  done
+  if [ -e "$DISTCC_PATH/$ARCH-rawgcc" ]; then
+    for i in cc gcc g++ c++ ; do
+      ln --symbolic --force "$DISTCC_PATH/$ARCH-rawgcc" "${LXC_DIR}/system-image-$ARCH/distcc_links/$i"
+    done
+  fi
+
+  # PORT
+  DISTCC_PORT=$(unique_port)
+  echo "launching ${DISTCC} on port $DISTCC_PORT" >> "${OUTPUT_FILE}"
+
+  # CPUS
+  if [ -z "$CPUS" ]; then
+    # Current parallelism limits include:
+    #   - memory available to emulator (most targets max at 256 megs, which
+    #     gives about 80 megs/instance).
+    #   - speed of preprocessor (tcc -E would be faster than gcc -E)
+    #   - speed of virtual network (switch to virtual gigabit cards).
+    #
+    # CPUS=$(($(echo /sys/devices/system/cpu/cpu[0-9]* | wc -w)*2))
+    CPUS=3
+  fi
+
+  # start distcc daemon
+  start_distcc "$DISTCC_BIN" "${DISTCC_LISTEN}" "${DISTCC_ALLOW}" "$DISTCC_PORT" $CPUS "${DISTCC_TMPDIR}" "$ARCH"
+  if [ $? -ne 0 ]; then
+    echo "ERROR: ${DISTCC} failed to start" >> "${OUTPUT_FILE}"
+    return 1
+  fi
+
+  # check distcc daemon process
+  check_process "${DISTCC}" "${DISTCC_PID}"
+
+  if [ $? -eq 0 ]; then # distccd started
+     # Let the lxc container start know we're using distcc.
+     DISTCC_PATH_PREFIX="/usr/distcc:"
+     DISTCC_HOSTS="${HOSTS}:${PORT}/${CPUS}"
+     # create symbolic link to tmpdir
+     mkdir -p "${LXC_DIR}/distcc_tmp" &&
+     ln --symbolic --force "${DISTCC_TMPDIR}" "${LXC_DIR}/distcc_tmp" >> "${OUTPUT_FILE}" 2>&1
+     # write lxcinit script
+     echo "${DISTCC} start/running, process $(pgrep -F ${DISTCC_PID})" >> "${OUTPUT_FILE}"
+     write_lxcinit "$ARCH" "$PORT" $CPUS "$HOSTS" "$DISTCC_PATH_PREFIX" "$DISTCC_HOSTS"
+     return 0
+  else # distccd is not running
+     # write lxcinit script
+     echo "ERROR: ${DISTCC} failed to start" >> "${OUTPUT_FILE}"
+     write_lxcinit "$ARCH" "" $CPUS "" "" ""
+     return 1
+  fi
+fi
+
+return 0
+}
+
+start_ftp(){
+# start FTP daemon
+BIN="$1"
+HOST="$2"
+P="$3"
+
+ # remove FTP tempdir
+ remove_tmpdir "${FTP_TMPDIR}" || return 1
+
+ # create FTP tmpdir
+ create_tmpdir "${FTP_TMPDIR}" "${FTP_USER}" || return 1
+
+ # start ftp daemon
+ # Note that we tell it to start using nohup so lxc.hook.post-stop
+ # find it later to kill it after the lxc container exits.
+ nohup toybox nc -s $HOST -p $P -L busybox $BIN -w ${FTP_UPLOAD} > "${FTP_LOG}" 2>&1 & 
+ [ $? -eq 0 ] || return 1
+ echo $! > "${FTP_PID}"
+ return 0
+}
+
+setup_ftp(){
+# setup FTP daemon
+HOST="$1"
+
+# Do we already have an FTP daemon?
+if [ -z "${FTP_HOST}" ]; then
+  FTP_HOST="$HOST"
+elif [ -z "${FTP_PORT}" ]; then
+  FTP_PORT=21
+fi
+
+[ -z "$(which toybox)" ] && [ -e ${INSTALL_DIR}/host/toybox ] &&
+PATH="$PATH:${INSTALL_DIR}/host"
+
+if [ -z "${FTP_PORT}" ]; then
+  if [ -z "$(which toybox)" ]; then
+        echo "WARNING: can't find toybox, no ftp daemon launched." >> "${OUTPUT_FILE}"
+        return 1
+  else
+        # PORT
+        FTP_PORT=$(unique_port)
+        echo "launching ${FTP} on port $FTP_PORT" >> "${OUTPUT_FILE}"
+        # create FTP upload directory on Host
+        mkdir -p "${FTP_UPLOAD}"
+        # start FTP daemon
+        start_ftp "${FTP}" "$FTP_HOST" "$FTP_PORT"
+        if [ $? -ne 0 ]; then
+          echo "ERROR: ${FTP} failed to start" >> "${OUTPUT_FILE}"
+          return 1
+        fi
+        # check ftp daemon process
+        check_process "toybox" "${FTP_PID}"
+        if [ $? -eq 0 ]; then # ftpd started
+            # Let the lxc container start know we're using ftp.
+            # FTP_HOST= 
+            # FTP_PORT
+            # create symbolic link to tmpdir
+            mkdir -p "${LXC_DIR}/ftpd_tmp" &&
+            ln --symbolic --force "${FTP_TMPDIR}" "${LXC_DIR}/ftpd_tmp" >> "${OUTPUT_FILE}" 2>&1  
+            # write lxcinit script
+            echo "${FTP} start/running, process $(pgrep -F ${FTP_PID})" >> "${OUTPUT_FILE}"
+            #write_lxcinit ""
+            return 0
+        else # ftpd is not running
+            # write lxcinit script
+            echo "ERROR: ${FTP} failed to start" >> "${OUTPUT_FILE}"
+            #write_lxcinit ""
+            return 1
+        fi
+  fi
+fi
+
+return 0
+}
+
+cp_resolv() {
+ # copy resolv.conf
+ rm --force ${LXC_ROOTFS_PATH}/etc/resolv.conf >> "${OUTPUT_FILE}" 2>&1
+ cp --force /etc/resolv.conf ${LXC_ROOTFS_PATH}/etc/resolv.conf >> "${OUTPUT_FILE}" 2>&1
+}
+
+p_dev() {
+# generate static devices for the lxc container
+DEV="${LXC_ROOTFS_PATH}/dev"
+
+rm --force ${DEV}/null >> "${OUTPUT_FILE}" 2>&1
+rm --force ${DEV}/zero >> "${OUTPUT_FILE}" 2>&1
+mknod -m 666 ${DEV}/null c 1 3 >> "${OUTPUT_FILE}" 2>&1
+mknod -m 666 ${DEV}/zero c 1 5 >> "${OUTPUT_FILE}" 2>&1
+
+if [ ! -e ${DEV}/null ]; then
+ echo "failed to create ${DEV}/null" >> "${OUTPUT_FILE}" 2>&1
+fi
+
+if [ ! -e ${DEV}/zero ]; then
+ echo "failed to create ${DEV}/zero" >> "${OUTPUT_FILE}" 2>&1
+fi
+
+if [ ! -e ${DEV}/random ]; then
+ mknod -m 666 ${DEV}/random c 1 8 >> "${OUTPUT_FILE}" 2>&1
+fi
+
+if [ ! -e ${DEV}/urandom ]; then
+ mknod -m 666 ${DEV}/urandom c 1 9 >> "${OUTPUT_FILE}" 2>&1
+fi
+
+if [ ! -d ${DEV}/pts ]; then
+ mkdir -m 755 ${DEV}/pts >> "${OUTPUT_FILE}" 2>&1
+fi
+
+if [ ! -d ${DEV}/shm ]; then
+ mkdir -m 1777 ${DEV}/shm >> "${OUTPUT_FILE}" 2>&1
+fi
+
+if [ ! -e ${DEV}/tty ]; then
+ mknod -m 666 ${DEV}/tty c 5 0 >> "${OUTPUT_FILE}" 2>&1
+fi
+
+if [ ! -e ${DEV}/tty0 ]; then
+ mknod -m 666 ${DEV}/tty0 c 4 0 >> "${OUTPUT_FILE}" 2>&1
+fi
+
+if [ ! -e ${DEV}/tty1 ]; then
+ mknod -m 666 ${DEV}/tty1 c 4 1 >> "${OUTPUT_FILE}" 2>&1
+fi
+
+if [ ! -e ${DEV}/full ]; then
+ mknod -m 666 ${DEV}/full c 1 7 >> "${OUTPUT_FILE}" 2>&1
+fi
+
+if [ ! -e ${DEV}/initctl ]; then
+ mknod -m 600 ${DEV}/initctl p >> "${OUTPUT_FILE}" 2>&1
+fi
+
+if [ ! -e ${DEV}/console ]; then
+ mknod -m 622 ${DEV}/console c 5 1 >> "${OUTPUT_FILE}" 2>&1
+fi
+
+if [ ! -e ${DEV}/ptmx ]; then
+ mknod -m 666 ${DEV}/ptmx c 5 2 >> "${OUTPUT_FILE}" 2>&1
+fi
+
+return 0
+}
+
+mount_loop(){
+ # mount raw image
+ HDX="$1"
+ IMG="$2"
+ MOUNTDIR="${LXC_DIR}/$HDX"
+
+ if mount | grep ${MOUNTDIR} > /dev/null; then
+    echo "${MOUNTDIR} already mounted" >> "${OUTPUT_FILE}"
+    local NR=$(losetup --all | grep ${IMG} | cut -d':' -f1)
+ else
+    local NR=$(losetup -f)
+    losetup ${NR} ${IMG} >> "${OUTPUT_FILE}" 2>&1
+    if [ ! -d ${MOUNTDIR} ]; then
+        mkdir -p ${MOUNTDIR} >> "${OUTPUT_FILE}" 2>&1
+    fi
+    mount ${NR} ${MOUNTDIR} >> "${OUTPUT_FILE}" 2>&1 || NR=""
+ fi
+
+ echo "$NR"
+}
+
+umount_loop(){
+ # unmount raw image
+ HDX="$1"
+ MOUNTDIR="${LXC_DIR}/$HDX"
+
+ if local NR=$(mount | grep ${MOUNTDIR} | cut -d' ' -f1) > /dev/null; then
+    umount ${MOUNTDIR} >> "${OUTPUT_FILE}" 2>&1
+    #rm -rf ${MOUNTDIR} >> "${OUTPUT_FILE}" 2>&1
+    losetup --detach ${NR} >> "${OUTPUT_FILE}" 2>&1
+ fi
+
+ echo "$NR"
+}
+
+umount_all_loop(){
+#unmount all loop devices
+
+ # unmount hda
+ if [ -n "${HDA}" ]; then
+    if loop_hda=$(umount_loop "rootfs"); then
+        echo "$loop_hda deleted" >> "${OUTPUT_FILE}"
+    else
+        echo "failed to unmount ${HDA}" >> "${OUTPUT_FILE}"
+    fi
+ fi
+ # unmount hdb
+ if [ -n "${HDB}" ]; then
+    if loop_hdb=$(umount_loop "hdb"); then
+        echo "$loop_hdb deleted" >> "${OUTPUT_FILE}"
+    else
+        echo "failed to unmount ${HDA}" >> "${OUTPUT_FILE}"
+    fi
+ fi
+ # unmount hdc
+ if [ -n "${HDC}" ]; then
+    if loop_hdc=$(umount_loop "hdc"); then
+        echo "$loop_hdc deleted" >> "${OUTPUT_FILE}"
+    else
+        echo "failed to unmount ${HDC}" >> "${OUTPUT_FILE}"
+    fi
+ fi
+
+return 0
+}
+
+write_out(){
+ # write log
+ echo "date      : $(date)" > "${OUTPUT_FILE}"
+ echo "script    : $SCRIPT_NAME" >> "${OUTPUT_FILE}"
+ echo "scipt path: $SCRIPT_PATH" >> "${OUTPUT_FILE}"
+ echo "arguments : $ARGS" >> "${OUTPUT_FILE}"
+ echo "LXC_DIR: $LXC_DIR" >> "${OUTPUT_FILE}"
+ echo "DEFAULT_TMPDIR: $DEFAULT_TMPDIR" >> "${OUTPUT_FILE}"
+ echo "DISTCC_TMPDIR: $DISTCC_TMPDIR" >> "${OUTPUT_FILE}"
+ echo "FTP_TMPDIR: $FTP_TMPDIR" >> "${OUTPUT_FILE}"
+ echo "hook environment:" >> "${OUTPUT_FILE}"
+ env | grep LXC >> "${OUTPUT_FILE}"
+ echo " " >> "${OUTPUT_FILE}"
+}
+
