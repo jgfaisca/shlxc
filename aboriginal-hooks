@@ -6,7 +6,7 @@
 #
 # UBUNTU: add more loop devices:
 # edit /etc/defaults/grub
-# and the code max_loop=64 just after the GRUB_CMDLINE_LINUX_DEFAULT="quiet splash
+# add max_loop=64 just after the GRUB_CMDLINE_LINUX_DEFAULT
 # save then run update-grub and reboot the machine
 #
 # The following environment variables affect the behavior of this script:
