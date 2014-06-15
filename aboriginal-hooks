@@ -402,7 +402,7 @@ else
   if [ $? -eq 0 ]; then # distccd started
      # Let the lxc container start know we're using distcc.
      DISTCC_PATH_PREFIX="/usr/distcc:"
-     DISTCC_HOSTS="${HOSTS}:${PORT}/${CPUS}"
+     DISTCC_HOSTS="${HOSTS}:${DISTCC_PORT}/${CPUS}"
      # create symbolic link to tmpdir
      mkdir -p "${LXC_DIR}/distcc_tmp" &&
      ln --symbolic --force "${DISTCC_TMPDIR}" "${LXC_DIR}/distcc_tmp" >> "${OUTPUT_FILE}" 2>&1
