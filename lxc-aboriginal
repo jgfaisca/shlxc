@@ -5,7 +5,7 @@
 # Copy this script to /usr/share/lxc/templates
 #
 # requirements:
-# - add packages lxc-utils, rsync, wget 
+# - add packages lxc-utils, rsync, wget, squashfs-tools 
 # - linux kernel with relevant options enabled (see lxc-checkconfig)
 # - remove package busybox 
 # - a working internet connection
