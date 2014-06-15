@@ -17,7 +17,6 @@
 #
 # authors:
 # Jose Faisca <jose.faisca@gmail.com>
-# Rob Landley <rob@landley.net>
 #
 ###############################################################################
 
@@ -291,6 +290,8 @@ export PS1="(\$container:$ARCH:$CPUS) \w \\$ "
 export HOME="/home"
 export DISTCC_HOSTS="$DISTCC_HOSTS"
 export PATH="${DISTCC_PATH_PREFIX}/bin:/sbin"
+export FTP_SERVER="$FTP_HOST"
+export FTP_PORT="$FTP_PORT"
 
 if [ "\$$" -eq 1 ]; then
     cd /home
@@ -305,7 +306,7 @@ if [ "\$$" -eq 1 ]; then
         X=xx
         echo "Press any key for command line..."
         read -t 3 -n 1 X
-        if [ "$X" == xx ]; then
+        if [ "\$X" == xx ]; then
             echo "Running automated build."
             HANDOFF=/mnt/init
         fi
