@@ -4,11 +4,11 @@
 # template script to generating aboriginal lxc container
 # Copy this script to /usr/share/lxc/templates
 #
-# requires:
-# - lxc-utils package
+# requirements:
+# - add packages lxc-utils, rsync, wget 
 # - linux kernel with relevant options enabled (see lxc-checkconfig)
-# - rsync, wget and a working internet connection
-# - remove busybox from host
+# - remove package busybox 
+# - a working internet connection
 #
 # supported architectures (build from source):
 # armv4eb, armv4tl, armv4l, armv5l, armv6l, i486, i686, i586, i686-virtio, 
