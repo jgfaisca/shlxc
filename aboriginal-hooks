@@ -1,10 +1,11 @@
 #!/bin/bash 
 ###############################################################################
 #
-# A hook to be run in the host's namespace 
-# Copy this script to /usr/share/lxc/hooks
+# hook script for the aboriginal lxc container
+# to be run in the host's namespace 
+# copy this script to /usr/share/lxc/hooks
 #
-# UBUNTU: add more loop devices:
+# add more loop devices in Ubuntu host's:
 # edit /etc/defaults/grub
 # add max_loop=64 just after the GRUB_CMDLINE_LINUX_DEFAULT
 # save then run update-grub and reboot the machine
